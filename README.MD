@@ -144,4 +144,4 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - Contributors to pandas, matplotlib, seaborn, and numpy
 
 ## Contact
-For questions or feedback, please contact [your-email@example.com]
+For questions or feedback, please contact [khairul.islam@hws.edu]
