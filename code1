@@ -1,0 +1,478 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+from datetime import datetime
+import matplotlib.dates as mdates
+from matplotlib.ticker import FuncFormatter
+import os
+
+class CovidDataAnalyzer:
+    """
+    A class for analyzing and visualizing COVID-19 data.
+    """
+    
+    def __init__(self, file_path):
+        """
+        Initialize the analyzer with a file path to the COVID data.
+        
+        Args:
+            file_path (str): Path to the CSV file containing COVID data
+        """
+        self.file_path = file_path
+        self.data = None
+        self.load_data()
+        
+    def load_data(self):
+        """Load and preprocess the COVID data from CSV."""
+        # Read the CSV file
+        self.data = pd.read_csv(self.file_path)
+        
+        # Convert date column to datetime
+        self.data['date'] = pd.to_datetime(self.data['date'], format='%m/%d/%Y')
+        
+        # Sort data by date
+        self.data = self.data.sort_values('date')
+        
+        # Rename columns for better readability
+        self.data = self.data.rename(columns={
+            'new_cases_per_million': 'daily_cases',
+            'total_cases_per_million': 'cumulative_cases',
+            'new_cases_per_million_7_day_avg_right': '7day_avg'
+        })
+        
+        # Fill any missing values in the 7-day average column
+        self.data['7day_avg'] = self.data['7day_avg'].fillna(self.data['daily_cases'].rolling(window=7).mean())
+        
+        print(f"Data loaded successfully. Time range: {self.data['date'].min()} to {self.data['date'].max()}")
+        print(f"Total records: {len(self.data)}")
+        
+    def get_basic_stats(self):
+        """
+        Calculate basic statistics about the COVID data.
+        
+        Returns:
+            dict: Dictionary containing basic statistics
+        """
+        stats = {
+            'total_time_period': f"{self.data['date'].min()} to {self.data['date'].max()}",
+            'total_days': (self.data['date'].max() - self.data['date'].min()).days,
+            'max_daily_cases': self.data['daily_cases'].max(),
+            'max_daily_cases_date': self.data.loc[self.data['daily_cases'].idxmax(), 'date'].strftime('%Y-%m-%d'),
+            'max_7day_avg': self.data['7day_avg'].max(),
+            'max_7day_avg_date': self.data.loc[self.data['7day_avg'].idxmax(), 'date'].strftime('%Y-%m-%d'),
+            'total_cases_per_million': self.data['cumulative_cases'].max(),
+            'days_with_zero_cases': len(self.data[self.data['daily_cases'] == 0])
+        }
+        return stats
+    
+    def detect_waves(self, threshold_multiplier=1.5, min_duration=14, separation_days=30):
+        """
+        Detect COVID waves in the data based on 7-day average.
+        
+        Args:
+            threshold_multiplier (float): Multiplier of the mean to set as threshold for wave
+            min_duration (int): Minimum duration in days to consider as a wave
+            separation_days (int): Minimum days between waves
+            
+        Returns:
+            list: List of dictionaries containing information about each wave
+        """
+        # Calculate threshold for considering a wave (multiplier of mean)
+        threshold = self.data['7day_avg'].mean() * threshold_multiplier
+        
+        # Initialize variables
+        in_wave = False
+        wave_start = None
+        waves = []
+        
+        # Loop through data to detect waves
+        for i, row in self.data.iterrows():
+            if not in_wave and row['7day_avg'] > threshold:
+                # Wave start
+                in_wave = True
+                wave_start = row['date']
+            elif in_wave and row['7day_avg'] < threshold:
+                # Wave end
+                in_wave = False
+                wave_end = row['date']
+                duration = (wave_end - wave_start).days
+                
+                # Only include if wave meets minimum duration
+                if duration >= min_duration:
+                    # Get data for this wave period
+                    wave_data = self.data[(self.data['date'] >= wave_start) & (self.data['date'] <= wave_end)]
+                    
+                    waves.append({
+                        'start_date': wave_start.strftime('%Y-%m-%d'),
+                        'end_date': wave_end.strftime('%Y-%m-%d'),
+                        'duration_days': duration,
+                        'peak_date': wave_data.loc[wave_data['7day_avg'].idxmax(), 'date'].strftime('%Y-%m-%d'),
+                        'peak_value': wave_data['7day_avg'].max(),
+                        'mean_value': wave_data['7day_avg'].mean()
+                    })
+        
+        # If we're still in a wave at the end of the data
+        if in_wave:
+            wave_end = self.data['date'].max()
+            duration = (wave_end - wave_start).days
+            
+            if duration >= min_duration:
+                wave_data = self.data[(self.data['date'] >= wave_start) & (self.data['date'] <= wave_end)]
+                
+                waves.append({
+                    'start_date': wave_start.strftime('%Y-%m-%d'),
+                    'end_date': wave_end.strftime('%Y-%m-%d'),
+                    'duration_days': duration,
+                    'peak_date': wave_data.loc[wave_data['7day_avg'].idxmax(), 'date'].strftime('%Y-%m-%d'),
+                    'peak_value': wave_data['7day_avg'].max(),
+                    'mean_value': wave_data['7day_avg'].mean()
+                })
+        
+        # Merge waves that are too close to each other
+        i = 0
+        while i < len(waves) - 1:
+            current_end = datetime.strptime(waves[i]['end_date'], '%Y-%m-%d')
+            next_start = datetime.strptime(waves[i+1]['start_date'], '%Y-%m-%d')
+            
+            if (next_start - current_end).days < separation_days:
+                # Merge these waves
+                waves[i]['end_date'] = waves[i+1]['end_date']
+                waves[i]['duration_days'] = (datetime.strptime(waves[i]['end_date'], '%Y-%m-%d') - 
+                                           datetime.strptime(waves[i]['start_date'], '%Y-%m-%d')).days
+                
+                # Recalculate peak for the merged wave
+                merged_start = datetime.strptime(waves[i]['start_date'], '%Y-%m-%d')
+                merged_end = datetime.strptime(waves[i]['end_date'], '%Y-%m-%d')
+                merged_data = self.data[(self.data['date'] >= merged_start) & (self.data['date'] <= merged_end)]
+                
+                waves[i]['peak_date'] = merged_data.loc[merged_data['7day_avg'].idxmax(), 'date'].strftime('%Y-%m-%d')
+                waves[i]['peak_value'] = merged_data['7day_avg'].max()
+                waves[i]['mean_value'] = merged_data['7day_avg'].mean()
+                
+                # Remove the merged wave
+                waves.pop(i+1)
+            else:
+                i += 1
+        
+        return waves
+    
+    def calculate_growth_rates(self, window=30):
+        """
+        Calculate growth rates over specified time windows.
+        
+        Args:
+            window (int): Window size in days to calculate growth rate
+            
+        Returns:
+            pd.DataFrame: DataFrame with growth rates
+        """
+        # Calculate percentage change over the specified window
+        self.data['growth_rate'] = self.data['7day_avg'].pct_change(periods=window) * 100
+        
+        # Create a dataframe for growth rates
+        growth_df = pd.DataFrame({
+            'date': self.data['date'],
+            'growth_rate': self.data['growth_rate']
+        }).dropna()
+        
+        return growth_df
+    
+    def plot_overall_trend(self, save_path=None):
+        """
+        Plot the overall trend of COVID cases.
+        
+        Args:
+            save_path (str, optional): Path to save the plot. If None, plot is displayed.
+        """
+        plt.figure(figsize=(15, 8))
+        
+        # Plot daily cases
+        plt.bar(self.data['date'], self.data['daily_cases'], alpha=0.3, color='gray', label='Daily Cases')
+        
+        # Plot 7-day average
+        plt.plot(self.data['date'], self.data['7day_avg'], color='red', linewidth=2, label='7-day Average')
+        
+        # Format the x-axis to show dates nicely
+        plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
+        plt.gca().xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+        
+        # Format y-axis to show thousands separator
+        plt.gca().yaxis.set_major_formatter(FuncFormatter(lambda x, _: f'{x:,.0f}'))
+        
+        plt.title('COVID-19 New Cases per Million (Worldwide)', fontsize=16)
+        plt.xlabel('Date', fontsize=12)
+        plt.ylabel('Cases per Million', fontsize=12)
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path)
+            print(f"Plot saved to {save_path}")
+        else:
+            plt.show()
+            
+    def plot_waves(self, waves, save_path=None):
+        """
+        Plot the detected COVID waves.
+        
+        Args:
+            waves (list): List of wave dictionaries from detect_waves()
+            save_path (str, optional): Path to save the plot. If None, plot is displayed.
+        """
+        plt.figure(figsize=(15, 8))
+        
+        # Plot 7-day average
+        plt.plot(self.data['date'], self.data['7day_avg'], color='black', linewidth=2, label='7-day Average')
+        
+        # Color palette for waves
+        colors = plt.cm.tab10.colors
+        
+        # Plot each wave with different colors
+        for i, wave in enumerate(waves):
+            start_date = datetime.strptime(wave['start_date'], '%Y-%m-%d')
+            end_date = datetime.strptime(wave['end_date'], '%Y-%m-%d')
+            
+            # Get data for this wave
+            wave_data = self.data[(self.data['date'] >= start_date) & (self.data['date'] <= end_date)]
+            
+            # Plot the wave
+            color = colors[i % len(colors)]
+            plt.fill_between(wave_data['date'], wave_data['7day_avg'], alpha=0.3, color=color, 
+                            label=f'Wave {i+1}: {wave["start_date"]} to {wave["end_date"]}')
+            
+            # Mark the peak
+            peak_date = datetime.strptime(wave['peak_date'], '%Y-%m-%d')
+            peak_value = wave['peak_value']
+            plt.plot(peak_date, peak_value, 'o', color=color, markersize=8)
+            plt.text(peak_date, peak_value*1.1, f'Peak: {peak_value:.1f}', fontsize=9, ha='center')
+        
+        # Format the x-axis to show dates nicely
+        plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
+        plt.gca().xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+        
+        # Format y-axis to show thousands separator
+        plt.gca().yaxis.set_major_formatter(FuncFormatter(lambda x, _: f'{x:,.0f}'))
+        
+        plt.title('COVID-19 Waves Analysis', fontsize=16)
+        plt.xlabel('Date', fontsize=12)
+        plt.ylabel('Cases per Million (7-day Avg)', fontsize=12)
+        plt.grid(True, alpha=0.3)
+        plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path)
+            print(f"Plot saved to {save_path}")
+        else:
+            plt.show()
+    
+    def plot_growth_rates(self, growth_df, window=30, save_path=None):
+        """
+        Plot growth rates.
+        
+        Args:
+            growth_df (pd.DataFrame): DataFrame with growth rates
+            window (int): Window size in days used for growth rate calculation
+            save_path (str, optional): Path to save the plot. If None, plot is displayed.
+        """
+        plt.figure(figsize=(15, 8))
+        
+        # Plot growth rates
+        plt.plot(growth_df['date'], growth_df['growth_rate'], color='blue', linewidth=2)
+        
+        # Add a horizontal line at 0%
+        plt.axhline(y=0, color='red', linestyle='--', alpha=0.7)
+        
+        # Format the x-axis to show dates nicely
+        plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
+        plt.gca().xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+        
+        plt.title(f'COVID-19 {window}-Day Growth Rate (%)', fontsize=16)
+        plt.xlabel('Date', fontsize=12)
+        plt.ylabel(f'{window}-Day Growth Rate (%)', fontsize=12)
+        plt.grid(True, alpha=0.3)
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path)
+            print(f"Plot saved to {save_path}")
+        else:
+            plt.show()
+    
+    def plot_monthly_averages(self, save_path=None):
+        """
+        Plot monthly averages of COVID cases.
+        
+        Args:
+            save_path (str, optional): Path to save the plot. If None, plot is displayed.
+        """
+        # Create a copy of the data and extract year and month
+        monthly_data = self.data.copy()
+        monthly_data['year'] = monthly_data['date'].dt.year
+        monthly_data['month'] = monthly_data['date'].dt.month
+        
+        # Group by year and month and calculate mean
+        monthly_avg = monthly_data.groupby(['year', 'month'])['daily_cases'].mean().reset_index()
+        
+        # Create a date column for plotting
+        monthly_avg['date'] = pd.to_datetime(monthly_avg['year'].astype(str) + '-' + monthly_avg['month'].astype(str) + '-01')
+        
+        plt.figure(figsize=(15, 8))
+        
+        # Plot monthly averages
+        plt.bar(monthly_avg['date'], monthly_avg['daily_cases'], width=20, alpha=0.7)
+        
+        # Format the x-axis to show dates nicely
+        plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
+        plt.gca().xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+        
+        # Format y-axis to show thousands separator
+        plt.gca().yaxis.set_major_formatter(FuncFormatter(lambda x, _: f'{x:,.0f}'))
+        
+        plt.title('COVID-19 Monthly Average New Cases per Million', fontsize=16)
+        plt.xlabel('Date', fontsize=12)
+        plt.ylabel('Average Cases per Million', fontsize=12)
+        plt.grid(True, alpha=0.3)
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path)
+            print(f"Plot saved to {save_path}")
+        else:
+            plt.show()
+    
+    def plot_heatmap(self, save_path=None):
+        """
+        Create a heatmap showing COVID cases by month and year.
+        
+        Args:
+            save_path (str, optional): Path to save the plot. If None, plot is displayed.
+        """
+        # Create a copy of the data and extract year and month
+        heatmap_data = self.data.copy()
+        heatmap_data['year'] = heatmap_data['date'].dt.year
+        heatmap_data['month'] = heatmap_data['date'].dt.month
+        
+        # Group by year and month and calculate mean
+        monthly_avg = heatmap_data.groupby(['year', 'month'])['daily_cases'].mean().reset_index()
+        
+        # Create a pivot table for the heatmap
+        pivot_data = monthly_avg.pivot(index='month', columns='year', values='daily_cases')
+        
+        # Define month names
+        month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+        pivot_data.index = [month_names[i-1] for i in pivot_data.index]
+        
+        plt.figure(figsize=(12, 8))
+        
+        # Create the heatmap
+        sns.heatmap(pivot_data, cmap='YlOrRd', annot=True, fmt='.1f', linewidths=.5, cbar_kws={'label': 'Average Cases per Million'})
+        
+        plt.title('COVID-19 Monthly Average Cases by Year', fontsize=16)
+        plt.ylabel('Month', fontsize=12)
+        plt.xlabel('Year', fontsize=12)
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path)
+            print(f"Plot saved to {save_path}")
+        else:
+            plt.show()
+    
+    def generate_full_report(self, output_dir='covid_report'):
+        """
+        Generate a full report with all analyses and visualizations.
+        
+        Args:
+            output_dir (str): Directory where to save the report files
+        """
+        # Create output directory if it doesn't exist
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+            print(f"Created directory: {output_dir}")
+        
+        # Get basic statistics
+        stats = self.get_basic_stats()
+        
+        # Detect waves
+        waves = self.detect_waves()
+        
+        # Calculate growth rates
+        growth_df = self.calculate_growth_rates()
+        
+        # Save all plots
+        self.plot_overall_trend(save_path=f"{output_dir}/overall_trend.png")
+        self.plot_waves(waves, save_path=f"{output_dir}/covid_waves.png")
+        self.plot_growth_rates(growth_df, save_path=f"{output_dir}/growth_rates.png")
+        self.plot_monthly_averages(save_path=f"{output_dir}/monthly_averages.png")
+        self.plot_heatmap(save_path=f"{output_dir}/monthly_heatmap.png")
+        
+        # Generate a text report
+        with open(f"{output_dir}/covid_report.txt", 'w') as f:
+            f.write("COVID-19 DATA ANALYSIS REPORT\n")
+            f.write("=" * 30 + "\n\n")
+            
+            f.write("BASIC STATISTICS\n")
+            f.write("-" * 20 + "\n")
+            for key, value in stats.items():
+                f.write(f"{key.replace('_', ' ').title()}: {value}\n")
+            f.write("\n")
+            
+            f.write("COVID WAVES ANALYSIS\n")
+            f.write("-" * 20 + "\n")
+            f.write(f"Total number of waves detected: {len(waves)}\n\n")
+            
+            for i, wave in enumerate(waves):
+                f.write(f"Wave {i+1}:\n")
+                for key, value in wave.items():
+                    f.write(f"  {key.replace('_', ' ').title()}: {value}\n")
+                f.write("\n")
+            
+            f.write("REPORT SUMMARY\n")
+            f.write("-" * 20 + "\n")
+            f.write(f"Date range analyzed: {stats['total_time_period']}\n")
+            f.write(f"Peak daily cases occurred on: {stats['max_daily_cases_date']} ({stats['max_daily_cases']:.2f} per million)\n")
+            f.write(f"Peak 7-day average occurred on: {stats['max_7day_avg_date']} ({stats['max_7day_avg']:.2f} per million)\n")
+            f.write(f"Total cases per million at end of period: {stats['total_cases_per_million']:.2f}\n")
+            
+        print(f"Report generated in: {output_dir}")
+        
+        # Return the path to the report for convenience
+        return f"{output_dir}/covid_report.txt"
+
+
+# Main execution
+if __name__ == "__main__":
+    # Initialize the analyzer with the COVID data file
+    analyzer = CovidDataAnalyzer('covid_data.csv')
+    
+    # Generate a full report
+    report_path = analyzer.generate_full_report()
+    
+    print(f"Full analysis complete. Report saved to: {report_path}")
+    
+    # Additional analysis examples
+    
+    # Get basic statistics
+    stats = analyzer.get_basic_stats()
+    print("\nBASIC STATISTICS:")
+    for key, value in stats.items():
+        print(f"{key}: {value}")
+    
+    # Detect COVID waves
+    waves = analyzer.detect_waves()
+    print(f"\nDETECTED {len(waves)} COVID WAVES:")
+    for i, wave in enumerate(waves):
+        print(f"Wave {i+1}: {wave['start_date']} to {wave['end_date']} (Peak: {wave['peak_date']})")
+    
+    # Calculate monthly averages
+    print("\nGENERATING VISUALIZATIONS...")
+    analyzer.plot_monthly_averages()
+    
+    print("\nAnalysis complete!")
